@@ -22,7 +22,10 @@ if (isProduction && JWT_SECRET === 'dev-only-change-me') {
 
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+// File messages are capped at 5 MB. The WebSocket payload limit allows the
+// authenticated upload flow to carry the base64 representation without the
+// connection being terminated by ws before the server can validate it.
+const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
 
 // Demo-friendly persistent-in-process store. For a production deployment, replace with PostgreSQL/Redis.
 const users = new Map();
@@ -120,7 +123,6 @@ app.get('/api/notifications', requireAuth, (req, res) => res.json(notifications.
 
 app.post('/api/upload', requireAuth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Unsupported or missing file.' });
-  // Demo transfer: send the file as a short-lived data URL through the authenticated WebSocket.
   if (req.file.size > 5 * 1024 * 1024) return res.status(413).json({ error: 'File is too large.' });
   const dataUrl = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
   res.json({ name: req.file.originalname.replace(/[^a-zA-Z0-9._ -]/g, '').slice(0, 80) || 'file', type: req.file.mimetype, size: req.file.size, dataUrl });
