@@ -10,24 +10,20 @@ import rateLimit from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
 import multer from 'multer';
 import { WebSocketServer } from 'ws';
+import { databaseEnabled, initDb, loadUsers, insertUser, findUserByUsername } from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.PORT || 10000);
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-change-me';
 const isProduction = process.env.NODE_ENV === 'production';
 
-if (isProduction && JWT_SECRET === 'dev-only-change-me') {
-  throw new Error('JWT_SECRET must be configured in production.');
-}
+if (isProduction && JWT_SECRET === 'dev-only-change-me') throw new Error('JWT_SECRET must be configured in production.');
 
 const app = express();
 const server = http.createServer(app);
-// File messages are capped at 5 MB. The WebSocket payload limit allows the
-// authenticated upload flow to carry the base64 representation without the
-// connection being terminated by ws before the server can validate it.
+// File messages are capped at 5 MB; the WebSocket envelope is allowed up to 8 MB.
 const wss = new WebSocketServer({ noServer: true, maxPayload: 8 * 1024 * 1024 });
 
-// Demo-friendly persistent-in-process store. For a production deployment, replace with PostgreSQL/Redis.
 const users = new Map();
 const rooms = new Map([
   ['general', { id: 'general', name: 'General', description: 'The main PulseChat room', members: new Set() }],
@@ -38,8 +34,16 @@ const messages = new Map();
 const sockets = new Map();
 const dmMessages = new Map();
 const notifications = new Map();
-
 for (const id of rooms.keys()) messages.set(id, []);
+
+// If DATABASE_URL is configured, accounts survive application restarts/redeploys.
+// Without it, local/demo mode remains available with the existing in-process store.
+const dbReady = initDb().then(() => loadUsers(users, notifications));
+
+dbReady.catch(error => {
+  console.error('Database initialization failed:', error.message);
+  if (databaseEnabled && isProduction) process.exit(1);
+});
 
 app.disable('x-powered-by');
 app.use(helmet({ crossOriginEmbedderPolicy: false, contentSecurityPolicy: false }));
@@ -82,10 +86,11 @@ const broadcast = (payload, filter = () => true) => {
 };
 const roomHistory = (roomId) => (messages.get(roomId) || []).slice(-100);
 
-app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'PulseChat', time: new Date().toISOString() }));
+app.get('/api/health', (_req, res) => res.json({ ok: true, service: 'PulseChat', database: databaseEnabled ? 'connected' : 'memory-mode', time: new Date().toISOString() }));
 app.get('/api/me', (req, res) => { const user = getAuth(req); res.json({ user: user ? safeUser(user) : null }); });
 
 app.post('/api/auth/register', async (req, res) => {
+  await dbReady;
   const username = cleanText(req.body.username, 24).toLowerCase();
   const displayName = cleanText(req.body.displayName || username, 32);
   const password = String(req.body.password || '');
@@ -93,6 +98,12 @@ app.post('/api/auth/register', async (req, res) => {
   if (password.length < 8 || password.length > 128) return res.status(400).json({ error: 'Password must be 8–128 characters.' });
   if ([...users.values()].some(u => u.username === username)) return res.status(409).json({ error: 'That username is already taken.' });
   const user = { id: crypto.randomUUID(), username, displayName, avatar: '', passwordHash: await bcrypt.hash(password, 12), createdAt: Date.now() };
+  try {
+    await insertUser(user);
+  } catch (error) {
+    if (error?.code === '23505') return res.status(409).json({ error: 'That username is already taken.' });
+    throw error;
+  }
   users.set(user.id, user);
   notifications.set(user.id, []);
   res.cookie('pulsechat', makeToken(user), { httpOnly: true, sameSite: 'lax', secure: isProduction, maxAge: 7 * 864e5 });
@@ -100,9 +111,14 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 app.post('/api/auth/login', async (req, res) => {
+  await dbReady;
   const username = cleanText(req.body.username, 24).toLowerCase();
   const password = String(req.body.password || '');
-  const user = [...users.values()].find(u => u.username === username);
+  let user = [...users.values()].find(u => u.username === username);
+  if (!user && databaseEnabled) {
+    user = await findUserByUsername(username);
+    if (user) { users.set(user.id, user); notifications.set(user.id, []); }
+  }
   if (!user || !(await bcrypt.compare(password, user.passwordHash))) return res.status(401).json({ error: 'Invalid username or password.' });
   res.cookie('pulsechat', makeToken(user), { httpOnly: true, sameSite: 'lax', secure: isProduction, maxAge: 7 * 864e5 });
   res.json({ user: safeUser(user) });
@@ -115,15 +131,11 @@ app.get('/api/rooms/:roomId/messages', requireAuth, (req, res) => {
   if (!rooms.has(req.params.roomId)) return res.status(404).json({ error: 'Room not found.' });
   res.json(roomHistory(req.params.roomId));
 });
-app.get('/api/dm/:userId/messages', requireAuth, (req, res) => {
-  const key = dmKey(req.user.id, req.params.userId);
-  res.json((dmMessages.get(key) || []).slice(-100));
-});
+app.get('/api/dm/:userId/messages', requireAuth, (req, res) => res.json((dmMessages.get(dmKey(req.user.id, req.params.userId)) || []).slice(-100)));
 app.get('/api/notifications', requireAuth, (req, res) => res.json(notifications.get(req.user.id) || []));
 
 app.post('/api/upload', requireAuth, upload.single('file'), (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'Unsupported or missing file.' });
-  if (req.file.size > 5 * 1024 * 1024) return res.status(413).json({ error: 'File is too large.' });
   const dataUrl = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
   res.json({ name: req.file.originalname.replace(/[^a-zA-Z0-9._ -]/g, '').slice(0, 80) || 'file', type: req.file.mimetype, size: req.file.size, dataUrl });
 });
@@ -184,7 +196,8 @@ wss.on('connection', (ws, user) => {
       }
       if (msg.type === 'file_message') {
         const to = msg.to ? users.get(cleanText(msg.to, 80)) : null;
-        const file = msg.file || {}; if (!file.dataUrl || String(file.dataUrl).length > 7_000_000 || !cleanText(file.name, 80)) return;
+        const file = msg.file || {};
+        if (!file.dataUrl || String(file.dataUrl).length > 7_000_000 || !cleanText(file.name, 80)) return;
         const recipientId = to?.id || null; const roomId = msg.roomId && rooms.has(msg.roomId) ? msg.roomId : null;
         const message = { id: crypto.randomUUID(), sender: safeUser(user), recipient: to ? safeUser(to) : null, roomId, file: { name: cleanText(file.name, 80), type: cleanText(file.type, 80), dataUrl: file.dataUrl }, createdAt: Date.now(), kind: 'file' };
         if (roomId) { const history = messages.get(roomId) || []; history.push(message); messages.set(roomId, history.slice(-500)); broadcast({ type: 'message', message }, uid => rooms.get(roomId).members.has(uid)); }
@@ -196,4 +209,4 @@ wss.on('connection', (ws, user) => {
 });
 
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
-server.listen(PORT, () => console.log(`PulseChat listening on ${PORT}`));
+server.listen(PORT, () => console.log(`PulseChat listening on ${PORT} (${databaseEnabled ? 'PostgreSQL' : 'memory-mode'})`));
